@@ -117,6 +117,13 @@ void CMediaManager::Stop()
   m_platformStorage.reset();
 }
 
+void CMediaManager::ScanForPresentMedia()
+{
+  std::unique_lock lock(m_CritSecStorageProvider);
+  if (m_platformStorage)
+    m_platformStorage->ScanForPresentMedia();
+}
+
 void CMediaManager::Initialize()
 {
   if (!m_platformStorage)
@@ -947,7 +954,7 @@ bool CMediaManager::Eject(const std::string& mountpath)
   return ejected;
 }
 
-void CMediaManager::EjectTray( const bool bEject, const char cDriveLetter )
+void CMediaManager::EjectTray(const bool bEject, const std::string& devicePath)
 {
 #ifdef HAS_OPTICAL_DRIVE
   if (m_platformDiscDriveHander)
@@ -955,14 +962,17 @@ void CMediaManager::EjectTray( const bool bEject, const char cDriveLetter )
 #ifdef HAVE_LIBBLURAY
     m_hasBlurayPlaylist = HasBlurayPlaylist::UNKNOWN;
 #endif
-    const std::string devicePath{TranslateDevicePath("")};
-    m_platformDiscDriveHander->EjectDriveTray(devicePath);
-    ResetDriveCaches(devicePath);
+    const std::string trayDevicePath{TranslateDevicePath(devicePath)};
+    if (bEject)
+      m_platformDiscDriveHander->EjectDriveTray(trayDevicePath);
+    else
+      m_platformDiscDriveHander->CloseDriveTray(trayDevicePath);
+    ResetDriveCaches(trayDevicePath);
   }
 #endif
 }
 
-void CMediaManager::CloseTray(const char cDriveLetter)
+void CMediaManager::CloseTray(const std::string& devicePath)
 {
 #ifdef HAS_OPTICAL_DRIVE
   if (m_platformDiscDriveHander)
@@ -970,14 +980,14 @@ void CMediaManager::CloseTray(const char cDriveLetter)
 #ifdef HAVE_LIBBLURAY
     m_hasBlurayPlaylist = HasBlurayPlaylist::UNKNOWN;
 #endif
-    const std::string devicePath{TranslateDevicePath("")};
-    m_platformDiscDriveHander->ToggleDriveTray(devicePath);
-    ResetDriveCaches(devicePath);
+    const std::string trayDevicePath{TranslateDevicePath(devicePath)};
+    m_platformDiscDriveHander->CloseDriveTray(trayDevicePath);
+    ResetDriveCaches(trayDevicePath);
   }
 #endif
 }
 
-void CMediaManager::ToggleTray(const char cDriveLetter)
+void CMediaManager::ToggleTray(const std::string& devicePath)
 {
 #ifdef HAS_OPTICAL_DRIVE
   if (m_platformDiscDriveHander)
@@ -985,9 +995,9 @@ void CMediaManager::ToggleTray(const char cDriveLetter)
 #ifdef HAVE_LIBBLURAY
     m_hasBlurayPlaylist = HasBlurayPlaylist::UNKNOWN;
 #endif
-    const std::string devicePath{TranslateDevicePath("")};
-    m_platformDiscDriveHander->ToggleDriveTray(devicePath);
-    ResetDriveCaches(devicePath);
+    const std::string trayDevicePath{TranslateDevicePath(devicePath)};
+    m_platformDiscDriveHander->ToggleDriveTray(trayDevicePath);
+    ResetDriveCaches(trayDevicePath);
   }
 #endif
 }
@@ -1043,6 +1053,7 @@ void CMediaManager::AddOpticalSource(const std::string& devicePath)
 {
   CMediaSource share;
   share.strPath = devicePath;
+  share.strDevicePath = devicePath;
   share.strName = devicePath;
 
   RemoveAutoSource(share);
