@@ -19,9 +19,11 @@
 #include "dialogs/GUIDialogKaiToast.h"
 #include "dialogs/GUIDialogPlayEject.h"
 #ifdef HAVE_LIBBLURAY
+#include "filesystem/BlurayDirectory.h"
 #include "filesystem/BlurayDiscCache.h"
 #endif
 #include "filesystem/File.h"
+#include "filesystem/SpecialProtocol.h"
 #include "guilib/GUIComponent.h"
 #include "guilib/GUIWindowManager.h"
 #include "jobs/JobManager.h"
@@ -53,6 +55,7 @@
 #endif
 #endif
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <string>
@@ -135,6 +138,13 @@ void CMediaManager::Initialize()
   m_strFirstAvailDrive = m_platformStorage->GetFirstOpticalDeviceFileName();
 #endif
   m_platformStorage->Initialize();
+#ifndef TARGET_WINDOWS
+  {
+    // Discs already in the drive(s)
+    std::unique_lock lock(m_CritSecStorageProvider);
+    m_removableDrivePaths = GetRemovableDrivePaths();
+  }
+#endif
 }
 
 void CMediaManager::LoadSources()
@@ -216,6 +226,30 @@ void CMediaManager::GetLocalDrives(std::vector<CMediaSource>& localDrives, bool 
 {
   std::unique_lock lock(m_CritSecStorageProvider);
   m_platformStorage->GetLocalDrives(localDrives);
+
+  const std::string profilePath =
+      URIUtils::GetRealPath(CSpecialProtocol::TranslatePath("special://profile/"));
+  const std::string parentPath = URIUtils::GetParentPath(profilePath);
+  if (profilePath.empty() || parentPath.empty() ||
+      URIUtils::PathEquals(profilePath, parentPath, true))
+    return;
+
+  if (std::any_of(localDrives.begin(), localDrives.end(),
+                  [&profilePath](const CMediaSource& source)
+                  {
+                    return URIUtils::PathEquals(
+                        profilePath,
+                        URIUtils::GetRealPath(CSpecialProtocol::TranslatePath(source.strPath)),
+                        true);
+                  }))
+    return;
+
+  CMediaSource profile;
+  profile.strPath = profilePath;
+  profile.strName = CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(20070);
+  profile.m_ignore = true;
+  profile.m_iDriveType = SourceType::LOCAL;
+  localDrives.insert(localDrives.begin(), profile);
 }
 
 void CMediaManager::GetRemovableDrives(std::vector<CMediaSource>& removableDrives)
@@ -1003,11 +1037,43 @@ void CMediaManager::ToggleTray(const std::string& devicePath)
 #endif
 }
 
+#ifndef TARGET_WINDOWS
+std::set<std::string> CMediaManager::GetRemovableDrivePaths() const
+{
+  std::vector<CMediaSource> drives;
+  m_platformStorage->GetRemovableDrives(drives);
+  std::set<std::string> paths;
+  for (const auto& drive : drives)
+  {
+    paths.insert(drive.strPath);
+    if (!drive.strDevicePath.empty())
+      paths.insert(drive.strDevicePath);
+  }
+  return paths;
+}
+#endif
+
 void CMediaManager::ProcessEvents()
 {
   std::unique_lock lock(m_CritSecStorageProvider);
   if (m_platformStorage->PumpDriveChangeEvents(this))
   {
+#ifndef TARGET_WINDOWS
+    // Windows learns which drive changed through the storage callbacks and forgets its disc
+    // there
+    // A disc the OS has not mounted is never listed, but is still probed by its device node
+    if (const std::string opticalDevice{m_platformStorage->GetFirstOpticalDeviceFileName()};
+        !opticalDevice.empty())
+      RemoveDiscInfo(opticalDevice);
+
+    std::set<std::string> current{GetRemovableDrivePaths()};
+    for (const auto& path : m_removableDrivePaths)
+      RemoveDiscInfo(path);
+    for (const auto& path : current)
+      RemoveDiscInfo(path);
+    m_removableDrivePaths = std::move(current);
+#endif
+
 #if defined(HAS_OPTICAL_DRIVE)
 #if defined(TARGET_DARWIN_OSX)
     // darwins GetFirstOpticalDeviceFileName only gives us something
@@ -1226,11 +1292,13 @@ UTILS::DISCS::DiscInfo CMediaManager::GetDiscInfo(const std::string& mediaPath)
     if (!info.empty())
       return info;
   }
+#ifdef HAVE_LIBBLURAY
   // check for Blu-ray discs
   if (CFileUtils::Exists(URIUtils::AddFileToFolder(mediaPath, "BDMV", "index.bdmv")))
   {
-    info = UTILS::DISCS::ProbeBlurayDiscInfo(mediaPath);
+    info = XFILE::CBlurayDirectory::ProbeDisc(mediaPath);
   }
+#endif
 
   return info;
 }
