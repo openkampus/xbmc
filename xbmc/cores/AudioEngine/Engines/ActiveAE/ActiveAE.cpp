@@ -26,6 +26,8 @@
 #include "utils/log.h"
 #include "windowing/WinSystem.h"
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
 #include <mutex>
 
@@ -42,6 +44,20 @@ constexpr float MIN_WATER_LEVEL = 0.02f; // min buffer time to prevent underrun
 constexpr float MIN_WATER_LEVEL_RESAMPLE = 0.1f; // min buffer time in resample mode
 constexpr float BUFFER_LEVEL_INCREMENT = 0.0001f; // increment step for ramp-up
 constexpr double MAX_BUFFER_TIME = 0.1; // max time of a buffer in seconds;
+constexpr double MAX_LATE_START_MS = 500.0; // late start of audio left to the player's clock
+
+//! \brief Retry interval for a sink that will not open, doubling to a ceiling.
+//! A device that returns announces itself, so only a fault that clears by itself needs the
+//! interval to stay short.
+std::chrono::milliseconds ErrorRetryDelay(unsigned int consecutiveFailures)
+{
+  constexpr std::chrono::milliseconds FIRST{500};
+  constexpr std::chrono::milliseconds CEILING{30000};
+
+  const unsigned int doublings = std::min(consecutiveFailures ? consecutiveFailures - 1 : 0u, 8u);
+  const std::chrono::milliseconds delay{FIRST.count() * (1LL << doublings)};
+  return std::min(delay, CEILING);
+}
 
 bool IsDefaultDevice(const AESinkDevice& device)
 {
@@ -260,6 +276,18 @@ float CEngineStats::GetWaterLevel()
   else
     return static_cast<float>(static_cast<double>(m_bufferedSamples) *
                               m_sinkFormat.m_streamInfo.GetDuration() / 1000.0);
+}
+
+int CEngineStats::GetBufferedSamples()
+{
+  std::unique_lock lock(m_lock);
+  return m_bufferedSamples;
+}
+
+double CEngineStats::GetSinkDelaySeconds()
+{
+  std::unique_lock lock(m_lock);
+  return m_sinkDelay.delay;
 }
 
 void CEngineStats::SetSuspended(bool state)
@@ -516,7 +544,29 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
       break;
 
     case AE_TOP_ERROR:
-      if (port == NULL) // timeout
+      if (port == &m_controlPort)
+      {
+        switch (signal)
+        {
+          case CActiveAEControlProtocol::DEVICECHANGE:
+          case CActiveAEControlProtocol::DEFAULTDEVICECHANGE:
+          case CActiveAEControlProtocol::DEVICECOUNTCHANGE:
+            if (m_extTimeout != 0ms)
+            {
+              m_sink.EnumerateSinkList(true, "");
+              m_extErrorRetries = 0;
+              m_extTimeout = 0ms;
+            }
+            return;
+          case CActiveAEControlProtocol::RECONFIGURE:
+            m_extErrorRetries = 0;
+            m_extTimeout = 0ms;
+            return;
+          default:
+            break;
+        }
+      }
+      else if (port == NULL) // timeout
       {
         switch (signal)
         {
@@ -526,13 +576,14 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
           Configure();
           if (!m_extError)
           {
+            m_extErrorRetries = 0;
             m_state = AE_TOP_CONFIGURED_PLAY;
             m_extTimeout = 0ms;
           }
           else
           {
             m_state = AE_TOP_ERROR;
-            m_extTimeout = 500ms;
+            m_extTimeout = ErrorRetryDelay(++m_extErrorRetries);
           }
           return;
         default:
@@ -683,6 +734,7 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
           m_sink.EnumerateSinkList(true, "");
           LoadSettings();
           ValidateOutputDevices(false);
+          m_extErrorRetries = 0;
           m_extError = false;
           Configure();
           if (!m_extError)
@@ -1617,6 +1669,27 @@ void CActiveAE::FlushEngine()
   if (m_vizBuffers)
     m_vizBuffers->Flush();
 
+  // The AC3/EAC3 encoder keeps internal state (MDCT overlap, partially filled input frame).
+  // If it survives a flush, the first encoded frame after seek/pause mixes stale data from the
+  // old position with the new audio, which results in an audible pop. Start from a clean encoder.
+  if (m_mode == MODE_TRANSCODE && m_encoder)
+  {
+    AEAudioFormat encFormat = m_encoderFormat;
+    delete m_encoder;
+    m_encoder = new CAEEncoderFFmpeg();
+    if (m_encoder->Initialize(encFormat, true))
+    {
+      m_encoderFormat = encFormat;
+    }
+    else
+    {
+      CLog::Log(LOGERROR, "ActiveAE::{} - failed to re-initialize encoder on flush", __FUNCTION__);
+      delete m_encoder;
+      m_encoder = nullptr;
+      m_extError = true;
+    }
+  }
+
   // send message to sink
   Message *reply;
   if (m_sink.m_controlPort.SendOutMessageSync(CSinkControlProtocol::FLUSH, &reply, 2s))
@@ -2059,8 +2132,7 @@ bool CActiveAE::RunStages()
 
   // TrueHD is very jumpy, meaning the frames don't come in equidistantly. They are only smoothed
   // at the end when the IEC packing happens. Therefore adjust earlier.
-  const bool isTrueHDPassthrough =
-      (m_mode == MODE_RAW && m_sinkFormat.m_streamInfo.m_type == CAEStreamInfo::STREAM_TYPE_TRUEHD);
+  const bool isTrueHDPassthrough{IsTrueHDPassthrough()};
 
   if (m_settings.lowLatencyMode)
   {
@@ -2108,12 +2180,22 @@ bool CActiveAE::RunStages()
 
         if (error > maxError)
         {
-          CLog::Log(LOGWARNING, "ActiveAE - large audio sync error: {:f}", error);
+          const double waterLevelMs = static_cast<double>(m_stats.GetWaterLevel()) * 1000.0;
+          CLog::Log(LOGWARNING,
+                    "ActiveAE - large audio sync error: {:.1f} ms "
+                    "(pts={:.1f} delay={:.1f} clock={:.1f} bufSamples={} sinkDelay={:.1f} water={:.1f})",
+                    error, pts, delay, (*it)->m_pClock->GetClock(), m_stats.GetBufferedSamples(),
+                    m_stats.GetSinkDelaySeconds() * 1000.0, waterLevelMs);
           error = maxError;
         }
         else if (error < -maxError)
         {
-          CLog::Log(LOGWARNING, "ActiveAE - large audio sync error: {:f}", error);
+          const double waterLevelMs = static_cast<double>(m_stats.GetWaterLevel()) * 1000.0;
+          CLog::Log(LOGWARNING,
+                    "ActiveAE - large audio sync error: {:.1f} ms "
+                    "(pts={:.1f} delay={:.1f} clock={:.1f} bufSamples={} sinkDelay={:.1f} water={:.1f})",
+                    error, pts, delay, (*it)->m_pClock->GetClock(), m_stats.GetBufferedSamples(),
+                    m_stats.GetSinkDelaySeconds() * 1000.0, waterLevelMs);
           error = -maxError;
         }
         (*it)->m_syncError.Add(error);
@@ -2489,6 +2571,12 @@ bool CActiveAE::HasWork()
   return false;
 }
 
+bool CActiveAE::IsTrueHDPassthrough() const
+{
+  return m_mode == MODE_RAW &&
+         m_sinkFormat.m_streamInfo.m_type == CAEStreamInfo::STREAM_TYPE_TRUEHD;
+}
+
 CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
 {
   CSampleBuffer *ret = NULL;
@@ -2502,6 +2590,7 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
     stream->m_syncError.Flush(100ms);
     stream->m_processingBuffers->SetRR(1.0, m_settings.atempoThreshold);
     stream->m_resampleIntegral = 0;
+    stream->m_lateStartHandedOver = false;
     CLog::Log(LOGDEBUG,"ActiveAE - start sync of audio stream");
   }
 
@@ -2523,6 +2612,27 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
                                           : stream->GetErrorInterval();
   bool newerror = stream->m_syncError.Get(error, timeout);
 
+  if (newerror && stream->m_lateStartHandedOver)
+  {
+    // Mostly averaged before the player moved its clock to the late audio, so neither acted upon
+    // nor reported.
+    stream->m_lateStartHandedOver = false;
+    stream->m_syncError.Flush(timeout);
+    newerror = false;
+    CLog::Log(LOGDEBUG, "ActiveAE::SyncStream - average error {:f} dropped", error);
+  }
+
+  // Without resampling, the player moves its clock to the audio once the error exceeds its own
+  // limit. Audio starting late is therefore left to the player, as skipping it would lose the
+  // start of the audio. The errors of TrueHD passthrough are scaled down, so they do not tell how
+  // late the audio is.
+  const bool clockFollowsAudio{!stream->m_resampleMode && !IsTrueHDPassthrough()};
+  const auto keepAudible = [&](double syncError)
+  {
+    return fabs(syncError) <= threshold ||
+           (clockFollowsAudio && syncError < 0 && -syncError <= MAX_LATE_START_MS);
+  };
+
   if (newerror && fabs(error) > threshold && stream->m_syncState == CAESyncInfo::AESyncState::SYNC_INSYNC)
   {
     stream->m_syncState = CAESyncInfo::AESyncState::SYNC_ADJUST;
@@ -2534,12 +2644,29 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
   }
   else if (newerror && stream->m_syncState == CAESyncInfo::AESyncState::SYNC_MUTE)
   {
-    stream->m_syncState = CAESyncInfo::AESyncState::SYNC_ADJUST;
-    stream->m_lastSyncError = error;
-    CLog::Log(LOGDEBUG, "ActiveAE::SyncStream - average error of {:f}, start adjusting", error);
+    if (clockFollowsAudio && error < 0 && -error <= MAX_LATE_START_MS)
+    {
+      stream->m_syncState = CAESyncInfo::AESyncState::SYNC_INSYNC;
+      stream->m_syncError.Flush(1000ms);
+      // Reports the error to the player right away
+      stream->m_syncError.Correction(error);
+      stream->m_resampleIntegral = 0;
+      stream->m_lateStartHandedOver = true;
+      CLog::Log(LOGDEBUG,
+                "ActiveAE::SyncStream - average error of {:f}, left to the player's clock", error);
+    }
+    else
+    {
+      stream->m_syncState = CAESyncInfo::AESyncState::SYNC_ADJUST;
+      stream->m_lastSyncError = error;
+      CLog::Log(LOGDEBUG, "ActiveAE::SyncStream - average error of {:f}, start adjusting", error);
+    }
   }
 
-  if (stream->m_syncState == CAESyncInfo::AESyncState::SYNC_MUTE)
+  // While the error is averaged, samples that will not be skipped stay audible.
+  double errorSoFar{0.0};
+  const bool audible{stream->m_syncError.GetSoFar(errorSoFar) && keepAudible(errorSoFar)};
+  if (stream->m_syncState == CAESyncInfo::AESyncState::SYNC_MUTE && !audible)
   {
     CSampleBuffer *buf = stream->m_processingBuffers->m_outputSamples.front();
     if (m_mode == MODE_RAW)
@@ -2875,6 +3002,7 @@ void CActiveAE::HandleDeviceCountChange(const std::string& driver, bool defaultD
   UnconfigureSink();
   LoadSettings();
   ValidateOutputDevices(false);
+  m_extErrorRetries = 0;
   m_extError = false;
   Configure();
   if (!m_extError)

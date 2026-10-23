@@ -101,6 +101,13 @@ public:
 
   virtual void OnException(){} // signal termination handler
 
+protected:
+  virtual void OnStartup() {}
+  virtual void OnExit() {}
+  virtual void Process();
+
+  std::atomic<bool> m_bStop;
+
   enum WaitResponse { WAIT_INTERRUPTED = -1, WAIT_SIGNALED = 0, WAIT_TIMEDOUT = 1 };
 
   /**
@@ -119,13 +126,6 @@ public:
       (result == NULL ? WAIT_TIMEDOUT : WAIT_INTERRUPTED);
   }
 
-protected:
-  virtual void OnStartup() {}
-  virtual void OnExit() {}
-  virtual void Process();
-
-  std::atomic<bool> m_bStop;
-
 private:
   void Action();
 
@@ -137,7 +137,9 @@ private:
 
   std::string m_ThreadName;
   std::thread* m_thread = nullptr;
-  std::future<bool> m_future;
+  // identifies m_thread across a restart, which may reuse the address of a deleted thread
+  uint64_t m_threadGeneration = 0;
+  std::shared_future<bool> m_future;
 
   std::unique_ptr<IThreadImpl> m_impl;
 };

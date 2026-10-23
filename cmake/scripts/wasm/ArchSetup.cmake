@@ -34,6 +34,7 @@ set(APP_BINARY_SUFFIX ".js")
 # emcc --profiling keeps function names in the build so browser DevTools can
 # attribute samples; it is off by default because it inflates the binary.
 option(ENABLE_WASM_PROFILING "Enable Emscripten --profiling (CPU profiling in browser DevTools)" OFF)
+option(ENABLE_WASM_DEV_PROXY "Route cross-origin requests through tools/wasm/serve.py's /proxy" OFF)
 
 # Threading + memory (COOP/COEP headers required in HTML for pthreads).
 if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
@@ -52,10 +53,27 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     "SHELL:-sPROXY_TO_PTHREAD"
     "SHELL:-sMIN_WEBGL_VERSION=2"
     "SHELL:-sMAX_WEBGL_VERSION=2"
-    "SHELL:-sFULL_ES3=1"
+    # The WebGL context lives on the browser main thread; GL calls from the Kodi
+    # pthread are proxied to it and presented with wasm_webgl_commit_frame().
+    "SHELL:-sOFFSCREEN_FRAMEBUFFER=1"
+    "SHELL:-sGL_SUPPORT_EXPLICIT_SWAP_CONTROL=1"
     "SHELL:-lidbfs.js"
     "SHELL:-lembind"
+    # kodi_pre.js uses Module.ccall('kodi_wasm_dispatch_paste', ...) for clipboard paste.
+    "SHELL:-sEXPORTED_RUNTIME_METHODS=ccall,cwrap"
+    "SHELL:--pre-js ${CMAKE_SOURCE_DIR}/xbmc/platform/wasm/kodi_pre.js"
+    "SHELL:--js-library ${CMAKE_SOURCE_DIR}/xbmc/windowing/wasm/webgl_commit.js"
+    # BSD sockets over the Tizen Sockets Extension; falls back to the upstream
+    # implementation in ordinary browsers.
+    "SHELL:--js-library ${CMAKE_SOURCE_DIR}/xbmc/platform/wasm/network/tizen_sockets.js"
+    "SHELL:--js-library ${CMAKE_SOURCE_DIR}/xbmc/cores/VideoPlayer/DVDCodecs/Video/webcodecs_bridge.js"
   )
+
+  # tizen_sockets.js returns one getaddrinfo() node per address, and older
+  # Emscripten freeaddrinfo() frees only the first one.
+  if(EMSCRIPTEN_VERSION AND EMSCRIPTEN_VERSION VERSION_LESS 6.0.10)
+    message(WARNING "Emscripten ${EMSCRIPTEN_VERSION} leaks getaddrinfo() results on Tizen; use 6.0.10 or later")
+  endif()
 
   # ---------------------------------------------------------------------------
   # Debug vs Release
@@ -92,6 +110,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     add_link_options(--profiling)
     message(STATUS "WASM: Emscripten --profiling enabled (ENABLE_WASM_PROFILING=ON)")
   endif()
+
+  if(ENABLE_WASM_DEV_PROXY)
+    add_link_options("SHELL:--pre-js ${CMAKE_SOURCE_DIR}/tools/wasm/dev_proxy_pre.js")
+    message(STATUS "WASM: cross-origin requests routed through serve.py's /proxy (ENABLE_WASM_DEV_PROXY=ON)")
+  endif()
 endif()
 
 # Preload Kodi data directories into the Emscripten virtual filesystem under /kodi.
@@ -110,4 +133,5 @@ set(ENABLE_DVDCSS OFF CACHE BOOL "libdvdcss disabled for WASM" FORCE)
 set(ENABLE_AIRTUNES OFF CACHE BOOL "AirTunes not available in browser" FORCE)
 set(ENABLE_EVENTCLIENTS OFF CACHE BOOL "Event clients not used for WASM" FORCE)
 set(ENABLE_INTERNAL_FFMPEG ON CACHE BOOL "No system FFmpeg for Emscripten" FORCE)
+set(ENABLE_INTERNAL_OPUS ON CACHE BOOL "Enable internal opus?")
 

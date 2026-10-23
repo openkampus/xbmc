@@ -66,6 +66,7 @@ set(SOURCES AddonsDirectory.cpp
             ZipManager.cpp)
 
 set(HEADERS AddonsDirectory.h
+            AddonsPaths.h
             CacheStrategy.h
             CircularCache.h
             CurlFile.h
@@ -100,6 +101,7 @@ set(HEADERS AddonsDirectory.h
             IFileTypes.h
             ImageFile.h
             LibraryDirectory.h
+            LibraryPaths.h
             MultiPathDirectory.h
             MultiPathFile.h
             MusicDatabaseDirectory.h
@@ -187,6 +189,12 @@ if(ENABLE_UPNP)
                       UPnPFile.cpp)
   list(APPEND HEADERS UPnPDirectory.h
                       UPnPFile.h)
+endif()
+
+if(CORE_SYSTEM_NAME STREQUAL wasm)
+  list(APPEND SOURCES wasm/XhrFile.cpp)
+  list(APPEND HEADERS wasm/XhrFile.h
+                      wasm/XhrHttpClient.h)
 endif()
 
 core_add_library(filesystem)

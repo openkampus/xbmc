@@ -143,6 +143,21 @@ int CVideoTagLoaderNFO::GetBlurayPlaylist() const
   return m_nfoReader.GetBlurayPlaylist();
 }
 
+std::vector<XFILE::StackPartPlaylist> CVideoTagLoaderNFO::GetStackParts() const
+{
+  if (!m_nfoParsed)
+    return {};
+
+  std::vector<XFILE::StackPartPlaylist> parts{m_nfoReader.GetStackParts()};
+
+  // Stored relative to the nfo, as every part of a stack lives under the folder it is written to
+  const std::string base{URIUtils::GetDirectory(m_path)};
+  for (XFILE::StackPartPlaylist& part : parts)
+    part.file = URIUtils::AddFileToFolder(base, part.file);
+
+  return parts;
+}
+
 std::string CVideoTagLoaderNFO::FindNFO(const CFileItem& item,
                                         bool movieFolder) const
 {
@@ -158,6 +173,12 @@ std::string CVideoTagLoaderNFO::FindNFO(const CFileItem& item,
       item2.SetPath(URIUtils::AddFileToFolder(strPath,
                                             URIUtils::GetFileName(item.GetPath())));
       nfoFile = FindNFO(item2, movieFolder);
+      // else named after the archive, as exported (with -SxxEyy for one of several episodes)
+      if (nfoFile.empty())
+      {
+        item2.SetPath(url.GetHostName());
+        nfoFile = FindNFO(item2, movieFolder);
+      }
       return nfoFile;
     }
 
@@ -196,8 +217,25 @@ std::string CVideoTagLoaderNFO::FindNFO(const CFileItem& item,
       if (nfoFile.empty())
       {
         const std::string stackedTitlePath{CStackDirectory::GetStackTitlePath(item.GetPath())};
+        // A folder stack's title path is no folder to look in, but when the stack is named after
+        // the folder holding its parts, that is the movie's folder and its movie.nfo takes priority
+        const bool isFolderStack{URIUtils::HasSlashAtEnd(stackedTitlePath)};
+        if (movieFolder && isFolderStack)
+        {
+          std::string basePath{CStackDirectory::GetBasePath(item.GetPath())};
+          std::string titlePath{stackedTitlePath};
+          URIUtils::RemoveSlashAtEnd(basePath);
+          URIUtils::RemoveSlashAtEnd(titlePath);
+          if (URIUtils::GetFileName(titlePath) == URIUtils::GetFileName(basePath))
+          {
+            nfoFile = URIUtils::AddFileToFolder(basePath, "movie.nfo");
+            if (CFileUtils::Exists(nfoFile))
+              return nfoFile;
+            nfoFile.clear();
+          }
+        }
         item2.SetPath(stackedTitlePath);
-        nfoFile = FindNFO(item2, movieFolder);
+        nfoFile = FindNFO(item2, movieFolder && !isFolderStack);
       }
     }
     else

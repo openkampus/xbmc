@@ -8,6 +8,10 @@
 
 #include "PlatformWasm.h"
 
+#include "cores/AudioEngine/Sinks/AESinkWasmAudioWorklet.h"
+#include "filesystem/SpecialProtocol.h"
+#include "windowing/wasm/WinSystemWasmGLESContext.h"
+
 #include <cstdlib>
 
 CPlatform* CPlatform::CreateInstance()
@@ -20,5 +24,14 @@ bool CPlatformWasm::InitStageOne()
   if (!std::getenv("HOME"))
     setenv("HOME", "/home/web_user", 1);
 
-  return CPlatformPosix::InitStageOne();
+  if (!CPlatformPosix::InitStageOne())
+    return false;
+
+  setenv("SSL_CERT_FILE",
+         CSpecialProtocol::TranslatePath("special://xbmc/system/certs/cacert.pem").c_str(), 0);
+
+  CWinSystemWasmGLESContext::Register();
+  CAESinkWasmAudioWorklet::Register();
+
+  return true;
 }

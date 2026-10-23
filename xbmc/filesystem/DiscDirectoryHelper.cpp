@@ -14,6 +14,7 @@
 #include "dialogs/GUIDialogBusy.h"
 #include "dialogs/GUIDialogOK.h"
 #include "dialogs/GUIDialogSimpleMenu.h"
+#include "media/MediaType.h"
 #include "resources/LocalizeStrings.h"
 #include "resources/ResourcesComponent.h"
 #include "settings/AdvancedSettings.h"
@@ -21,6 +22,9 @@
 #include "settings/SettingsComponent.h"
 #include "settings/VideoVersionsSettings.h"
 #include "threads/IRunnable.h"
+#include "utils/ArtTypes.h"
+#include "utils/DefaultArt.h"
+#include "utils/ItemProperties.h"
 #include "utils/RegExp.h"
 #include "utils/StreamUtils.h"
 #include "utils/StringUtils.h"
@@ -28,6 +32,7 @@
 #include "utils/log.h"
 #include "video/VideoDatabase.h"
 #include "video/VideoManagerTypes.h"
+#include "video/VideoUtils.h"
 
 #include <algorithm>
 #include <array>
@@ -1967,28 +1972,25 @@ void CDiscDirectoryHelper::FindSpecials(const PlaylistMap& playlists)
   PlaylistVector playlistsLength;
   playlistsLength.reserve(playlists.size());
   playlistsLength.assign(playlists.begin(), playlists.end());
-  if (m_numEpisodes > 0)
-  {
-    std::erase_if(
-        playlistsLength,
-        [this](const PlaylistVectorEntry& playlist)
-        {
-          const auto& [playlistNumber, playlistInformation] = playlist;
+  std::erase_if(
+      playlistsLength,
+      [this](const PlaylistVectorEntry& playlist)
+      {
+        const auto& [playlistNumber, playlistInformation] = playlist;
 
-          const bool isShort{playlistInformation.duration < MIN_SPECIAL_DURATION};
+        const bool isShort{playlistInformation.duration < MIN_SPECIAL_DURATION};
 
-          const auto candidatePlaylistNumbers{m_candidatePlaylists | std::views::keys};
-          const bool isEpisode{std::ranges::find(candidatePlaylistNumbers, playlistNumber) !=
-                               candidatePlaylistNumbers.end()};
+        const auto candidatePlaylistNumbers{m_candidatePlaylists | std::views::keys};
+        const bool isEpisode{std::ranges::find(candidatePlaylistNumbers, playlistNumber) !=
+                             candidatePlaylistNumbers.end()};
 
-          const auto playAllPlaylistNumbers{
-              m_playAllPlaylists | std::views::transform(&CandidatePlaylistInformation::playlist)};
-          const bool isPlayAll{std::ranges::find(playAllPlaylistNumbers, playlistNumber) !=
-                               playAllPlaylistNumbers.end()};
+        const auto playAllPlaylistNumbers{
+            m_playAllPlaylists | std::views::transform(&CandidatePlaylistInformation::playlist)};
+        const bool isPlayAll{std::ranges::find(playAllPlaylistNumbers, playlistNumber) !=
+                             playAllPlaylistNumbers.end()};
 
-          return isShort || isEpisode || isPlayAll;
-        });
-  }
+        return isShort || isEpisode || isPlayAll;
+      });
 
   // Sort playlists by length
   std::ranges::sort(playlistsLength,
@@ -2006,7 +2008,7 @@ void CDiscDirectoryHelper::FindSpecials(const PlaylistMap& playlists)
   if (playlistsLength.size() >= m_numSpecials)
   {
     for (unsigned int playlist : playlistsLength | std::views::keys)
-      m_candidateSpecials.emplace(playlist);
+      m_candidateSpecials.emplace_back(playlist);
   }
 }
 
@@ -2046,6 +2048,7 @@ std::shared_ptr<CFileItem> GenerateEpisodeItem(const CURL& url,
                                                std::chrono::milliseconds episodeStart = 0ms,
                                                std::chrono::milliseconds episodeDuration = 0ms)
 {
+  auto& localizeStrings{CServiceBroker::GetResourcesComponent().GetLocalizeStrings()};
   CURL path{url};
   std::string buf{StringUtils::Format("BDMV/PLAYLIST/{:05}.mpls", playlist)};
   path.SetFileName(buf);
@@ -2069,36 +2072,31 @@ std::shared_ptr<CFileItem> GenerateEpisodeItem(const CURL& url,
         static_cast<double>(information.duration.count()) / 1000.0;
   }
 
-  item->SetProperty("bluray_playlist", playlist);
+  item->SetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST, playlist);
 
   // Get episode title
   const std::string& title{episode.strTitle};
   if (isSpecial)
   {
     if (title.empty())
-      buf = CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(21350); /* Special */
+      buf = localizeStrings.Get(21350); /* Special */
     else
       /* Special xx - title */
-      buf = StringUtils::Format(
-          CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(21348), episode.iEpisode,
-          episode.strTitle);
+      buf = StringUtils::Format(localizeStrings.Get(21348), episode.iEpisode, episode.strTitle);
   }
   else
     /* Episode xx - title */
-    buf =
-        StringUtils::Format(CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(21349),
-                            episode.iEpisode, episode.strTitle);
+    buf = StringUtils::Format(localizeStrings.Get(21349), episode.iEpisode, episode.strTitle);
   item->SetTitle(buf);
   item->SetLabel(buf);
 
   item->SetLabel2(StringUtils::Format(
       "{0:s} - {1:s}: {2:s}\r\n{3:s}: {4:s}", GetTitleWithName(playlist, names),
-      CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(180) /* Duration */,
+      localizeStrings.Get(180) /* Duration */,
       StringUtils::SecondsToTimeString(static_cast<int>(duration.count() / 1000)),
-      CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24026) /* Languages */,
-      langs));
+      localizeStrings.Get(24026) /* Languages */, langs));
   item->SetSize(0);
-  item->SetArt("icon", "DefaultVideo.png");
+  item->SetArt(KODI::ART::TYPE::ICON, KODI::ART::DEFAULT::VIDEO);
 
   return item;
 }
@@ -2242,7 +2240,8 @@ void CDiscDirectoryHelper::LogEpisodePlaylistSearchResult(const CFileItemList& i
   std::vector<std::string> foundPlaylists;
   foundPlaylists.reserve(items.Size());
   for (const auto& item : items)
-    foundPlaylists.emplace_back(item->GetProperty("bluray_playlist").asString());
+    foundPlaylists.emplace_back(
+        item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asString());
   const std::string playlistList{foundPlaylists.empty() ? "none"
                                                         : StringUtils::Join(foundPlaylists, ",")};
 
@@ -2315,6 +2314,7 @@ std::shared_ptr<CFileItem> GenerateAllEpisodesItem(const CURL& url,
                                                    const PlaylistInformation& information,
                                                    const PlaylistNames& names)
 {
+  auto& localizeStrings{CServiceBroker::GetResourcesComponent().GetLocalizeStrings()};
   CURL path{url};
   path.SetFileName(StringUtils::Format("BDMV/PLAYLIST/{:05}.mpls", playlist));
   const auto item{std::make_shared<CFileItem>(path.Get(), false)};
@@ -2327,22 +2327,20 @@ std::shared_ptr<CFileItem> GenerateAllEpisodesItem(const CURL& url,
 
   CVideoInfoTag* itemTag{item->GetVideoInfoTag()};
   itemTag->SetDuration(static_cast<int>(duration.count() / 1000));
-  item->SetProperty("bluray_playlist", playlist);
+  item->SetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST, playlist);
 
   // Get title
-  const std::string title{StringUtils::Format(
-      CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(25005), playlist)};
+  const std::string title{StringUtils::Format(localizeStrings.Get(25005), playlist)};
   item->SetTitle(title);
   item->SetLabel(title);
 
   item->SetLabel2(StringUtils::Format(
       "{0:s}{1:s}: {2:s}\r\n{3:s}: {4:s}", GetNamePrefix(playlist, names),
-      CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(180) /* Duration */,
+      localizeStrings.Get(180) /* Duration */,
       StringUtils::SecondsToTimeString(static_cast<int>(duration.count() / 1000)),
-      CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24026) /* Languages */,
-      langs));
+      localizeStrings.Get(24026) /* Languages */, langs));
   item->SetSize(0);
-  item->SetArt("icon", "DefaultVideo.png");
+  item->SetArt(KODI::ART::TYPE::ICON, KODI::ART::DEFAULT::VIDEO);
 
   return item;
 }
@@ -2607,12 +2605,17 @@ const PlaylistInformation& GetBestMoviePlaylist(const std::vector<PlaylistInform
 
 bool IsRicherPresentation(const PlaylistInformation& a, const PlaylistInformation& b)
 {
+  // Streams a picture-in-picture copy adds go with the secondary video, which Kodi does not play
+  if (IsPictureInPicturePresentation(a) != IsPictureInPicturePresentation(b))
+    return !IsPictureInPicturePresentation(a);
   if (a.audioStreams.size() != b.audioStreams.size())
     return a.audioStreams.size() > b.audioStreams.size();
   if (a.pgStreams.size() != b.pgStreams.size())
     return a.pgStreams.size() > b.pgStreams.size();
   if (a.chapters.size() != b.chapters.size())
     return a.chapters.size() > b.chapters.size();
+  if (a.hasDolbyVision != b.hasDolbyVision)
+    return a.hasDolbyVision;
   return a.playlist < b.playlist;
 }
 
@@ -2876,6 +2879,7 @@ std::shared_ptr<CFileItem> GenerateMovieItem(const CURL& url,
                                              const PlaylistInformation& information,
                                              const PlaylistNames& names)
 {
+  auto& localizeStrings{CServiceBroker::GetResourcesComponent().GetLocalizeStrings()};
   CURL path{url};
   std::string buf{StringUtils::Format("BDMV/PLAYLIST/{:05}.mpls", playlist)};
   path.SetFileName(buf);
@@ -2886,12 +2890,12 @@ std::shared_ptr<CFileItem> GenerateMovieItem(const CURL& url,
 
   CVideoInfoTag* itemTag{item->GetVideoInfoTag()};
   itemTag->SetDuration(static_cast<int>(duration.count() / 1000));
-  item->SetProperty("bluray_playlist", playlist);
+  item->SetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST, playlist);
 
   buf = StringUtils::Format(
       playlist == mainPlaylist
-          ? CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(25004) /* Main Title */
-          : CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(25005) /* Title */,
+          ? localizeStrings.Get(25004) /* Main Title */
+          : localizeStrings.Get(25005) /* Title */,
       playlist);
   item->SetTitle(buf);
   item->SetLabel(buf);
@@ -2899,22 +2903,20 @@ std::shared_ptr<CFileItem> GenerateMovieItem(const CURL& url,
   // What the disc calls the playlist leads the description, as the label gives its number
   std::string label2{
       GetNamePrefix(playlist, names) +
-      StringUtils::Format(
-          CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(25007),
+      StringUtils::Format(localizeStrings.Get(25007),
           information.chapters.size(),
           StringUtils::SecondsToTimeString(static_cast<int>(duration.count() / 1000)))};
 
   // The streams a playlist starts on are what tells playlists offering the same content apart
   if (const std::string languages{GetDefaultStreamLanguages(information)}; !languages.empty())
     label2 += StringUtils::Format(
-        "\r\n{}: {}",
-        CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(24026) /* Languages */,
+        "\r\n{}: {}", localizeStrings.Get(24026) /* Languages */,
         languages);
 
   item->SetLabel2(label2);
 
   item->SetSize(0);
-  item->SetArt("icon", "DefaultVideo.png");
+  item->SetArt(KODI::ART::TYPE::ICON, KODI::ART::DEFAULT::VIDEO);
 
   return item;
 }
@@ -3009,7 +3011,8 @@ std::string DescribePlaylists(const CFileItemList& items)
   std::vector<std::string> playlists;
   playlists.reserve(items.Size());
   for (const auto& item : items)
-    playlists.emplace_back(std::to_string(item->GetProperty("bluray_playlist").asInteger32(-1)));
+    playlists.emplace_back(
+        std::to_string(item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger32(-1)));
   return playlists.empty() ? "nothing" : StringUtils::Join(playlists, ", ");
 }
 
@@ -3376,7 +3379,8 @@ void GetOrderedItems(CFileItemList& items, const std::vector<unsigned int>& want
   {
     for (const auto& item : items)
     {
-      if (item->GetProperty("bluray_playlist").asInteger32(-1) == static_cast<int>(playlist))
+      if (item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger32(-1) ==
+          static_cast<int>(playlist))
       {
         ordered.Add(item);
         break;
@@ -3416,8 +3420,12 @@ void CDiscDirectoryHelper::ApplyPlaylistHintsToMovie(const CURL& url,
 
   // disc.inf names the main title, which the heuristics keep and the project does not override
   const auto mainItem{std::ranges::find_if(
-      items, [mainPlaylist](const auto& item)
-      { return std::cmp_equal(item->GetProperty("bluray_playlist").asInteger(), mainPlaylist); })};
+      items,
+      [mainPlaylist](const auto& item)
+      {
+        return std::cmp_equal(item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger(),
+                              mainPlaylist);
+      })};
   const bool haveMain{mainPlaylist >= 0 && mainItem != items.end()};
   if (haveMain && job == GetTitle::SINGLE)
   {
@@ -3450,12 +3458,44 @@ void CDiscDirectoryHelper::ApplyPlaylistHintsToMovie(const CURL& url,
   std::vector<PlaylistInformation> selected;
   if (job == GetTitle::SINGLE)
   {
+    // The plain feature is of comparable length to the longest the disc names, not a seconds-long
+    // segment it also calls SEG_MainFeature
     const PlaylistHintMap& hints{m_hints->GetHints()};
+    const auto longest{std::ranges::max(
+        features | std::views::transform([&playlistMap](unsigned int playlist)
+                                         { return playlistMap.at(playlist).duration; }))};
     std::vector<unsigned int> base{features};
     std::erase_if(base,
-                  [&hints](unsigned int playlist) { return !hints.at(playlist).basePresentation; });
+                  [&hints, &playlistMap, longest](unsigned int playlist)
+                  {
+                    return !hints.at(playlist).basePresentation ||
+                           playlistMap.at(playlist).duration <
+                               longest * MAIN_TITLE_LENGTH_PERCENT / 100;
+                  });
     if (!base.empty())
       selected = select(base);
+
+    // Where the heuristics chose another named copy of that presentation, theirs is the fullest -
+    // eg. FPL_MainFeature_eng, whose pictures carry the translation FPL_MainFeature leaves out
+    if (!selected.empty() && !items.IsEmpty())
+    {
+      const unsigned int heuristic{
+          items[0]->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asUnsignedInteger32()};
+      if (std::ranges::find(features, heuristic) != features.end())
+      {
+        const PlaylistInformation& information{playlistMap.at(heuristic)};
+        const std::vector<std::chrono::milliseconds> clipDurations{
+            GetSortedClipDurations(information, clips)};
+        if (std::ranges::any_of(selected,
+                                [&](const PlaylistInformation& playlist)
+                                {
+                                  return IsSamePresentation(playlist,
+                                                            GetSortedClipDurations(playlist, clips),
+                                                            information, clipDurations);
+                                }))
+          selected = {information};
+      }
+    }
   }
   if (selected.empty())
     selected = select(features);
@@ -3484,7 +3524,8 @@ void CDiscDirectoryHelper::ApplyPlaylistHintsToMovie(const CURL& url,
   for (const auto& item : chosen)
   {
     AddStreamDetails(m_getStreamDetails, allTitles,
-                     item->GetProperty("bluray_playlist").asUnsignedInteger32(), *item);
+                     item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asUnsignedInteger32(),
+                     *item);
   }
 
   const std::string heuristic{DescribePlaylists(items)};
@@ -3506,7 +3547,8 @@ void CDiscDirectoryHelper::ApplyPlaylistHintsToMovie(const CURL& url,
 
     for (const auto& item : items)
     {
-      const unsigned int playlist{item->GetProperty("bluray_playlist").asUnsignedInteger32()};
+      const unsigned int playlist{
+          item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asUnsignedInteger32()};
       const PlaylistInformation& information{playlistMap.at(playlist)};
 
       // A sing-along is named as an extra, but is the feature presented differently
@@ -3545,8 +3587,8 @@ void CDiscDirectoryHelper::ApplyPlaylistHintsToMovie(const CURL& url,
           GetSortedClipDurations(mainInformation, clips)};
       for (int i = chosen.Size() - 1; i >= 0; --i)
       {
-        const PlaylistInformation& information{
-            playlistMap.at(chosen[i]->GetProperty("bluray_playlist").asUnsignedInteger32())};
+        const PlaylistInformation& information{playlistMap.at(
+            chosen[i]->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asUnsignedInteger32())};
         if (information.playlist == mainInformation.playlist ||
             IsSamePresentation(mainInformation, mainClipDurations, information,
                                GetSortedClipDurations(information, clips)))
@@ -3706,7 +3748,7 @@ void CDiscDirectoryHelper::AddRootOptions(const CURL& url,
     item->SetLabel(
         CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(25002) /* All titles */);
     item->SetSpecialSort(SortSpecial::BOTTOM); // below the playlists, however they are sorted
-    item->SetArt("icon", "DefaultVideoPlaylists.png");
+    item->SetArt(KODI::ART::TYPE::ICON, KODI::ART::DEFAULT::VIDEO_PLAYLISTS);
     items.Add(item);
   }
 
@@ -3718,7 +3760,7 @@ void CDiscDirectoryHelper::AddRootOptions(const CURL& url,
     item->SetLabel(
         CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(25003) /* Menu */);
     item->SetSpecialSort(SortSpecial::BOTTOM);
-    item->SetArt("icon", "DefaultProgram.png");
+    item->SetArt(KODI::ART::TYPE::ICON, KODI::ART::DEFAULT::PROGRAM);
     items.Add(item);
   }
 }
@@ -3751,7 +3793,7 @@ void LabelUsedPlaylists(CFileItemList& items,
 {
   for (const auto& item : items)
   {
-    const int playlist{item->GetProperty("bluray_playlist").asInteger32(-1)};
+    const int playlist{item->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger32(-1)};
     if (playlist < 0)
       continue;
 
@@ -3794,7 +3836,7 @@ void LabelUsedPlaylists(CFileItemList& items,
 // one already stored
 int PlaylistFromNfo(const CFileItem& item, int storedPlaylist)
 {
-  const int playlist{item.GetProperty("bluray_playlist").asInteger32(-1)};
+  const int playlist{item.GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger32(-1)};
   return playlist > -1 ? playlist : storedPlaylist;
 }
 
@@ -3866,8 +3908,9 @@ void ApplyPlaylistDetails(CFileItem& item,
   if (tag->GetAssetInfo().GetTitle().empty())
     tag->GetAssetInfo().SetTitle(
         CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(VIDEO_VERSION_ID_DEFAULT));
-  if (playlistItem.HasProperty("bluray_playlist"))
-    item.SetProperty("bluray_playlist", playlistItem.GetProperty("bluray_playlist"));
+  if (playlistItem.HasProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST))
+    item.SetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST,
+                     playlistItem.GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST));
 }
 } // unnamed namespace
 
@@ -3885,11 +3928,8 @@ bool CDiscDirectoryHelper::GetOrShowPlaylistSelection(const CFileItem& item,
   const std::string directory{
       [&item, &playback, &returnMultipleItems]
       {
-        const bool forceSelection{item.GetProperty("force_playlist_selection").asBoolean(false)};
-
-        // All episodes
-        if (item.HasProperty("episodes_start"))
-          return URIUtils::GetBlurayAllEpisodesPath(item.GetDynPath());
+        const bool forceSelection{
+            item.GetProperty(KODI::ITEM::PROPERTY::FORCE_PLAYLIST_SELECTION).asBoolean(false)};
 
         // Single episode
         if (item.GetVideoContentType() == VideoDbContentType::EPISODES && !forceSelection)
@@ -3984,18 +4024,28 @@ bool CDiscDirectoryHelper::GetOrShowPlaylistSelection(const CFileItem& item,
   {
     if (playback == MenuDecision::SHOW_SIMPLE_MENU)
     {
-      usedPlaylists =
-          database.GetPlaylistsByPath(URIUtils::GetBlurayPlaylistPath(item.GetDynPath()));
-
-      // The playlist this item already uses is labelled like any other, but choosing it again
-      // is no change and must not go through the reassignment
-      std::vector<CVideoDatabase::PlaylistInfo> reusablePlaylists{usedPlaylists};
-      if (CRegExp regex{true, CRegExp::autoUtf8, R"(\/(\d{5}).mpls$)"};
-          regex.RegFind(item.GetDynPath()) != -1)
+      // Playlists used by other items are only of interest if this choice will be saved, as
+      // choosing one of them reassigns the item it belongs to. The version manager saves its
+      // (version typed) items itself, but only when it asked for the selection.
+      std::vector<CVideoDatabase::PlaylistInfo> reusablePlaylists;
+      if (KODI::VIDEO::UTILS::CanSaveDiscPlaylist(item) ||
+          (item.HasVideoInfoTag() &&
+           item.GetVideoInfoTag()->GetMediaType() == KODI::MEDIA::TYPE::VIDEO_VERSION &&
+           item.GetProperty(KODI::ITEM::PROPERTY::FORCE_PLAYLIST_SELECTION).asBoolean(false)))
       {
-        const int playlist{std::stoi(regex.GetMatch(1))};
-        std::erase_if(reusablePlaylists, [&playlist](const CVideoDatabase::PlaylistInfo& p)
-                      { return p.playlist == playlist; });
+        usedPlaylists =
+            database.GetPlaylistsByPath(URIUtils::GetBlurayPlaylistPath(item.GetDynPath()));
+
+        // The playlist this item already uses is labelled like any other, but choosing it again
+        // is no change and must not go through the reassignment
+        reusablePlaylists = usedPlaylists;
+        if (CRegExp regex{true, CRegExp::autoUtf8, R"(\/(\d{5}).mpls$)"};
+            regex.RegFind(item.GetDynPath()) != -1)
+        {
+          const int playlist{std::stoi(regex.GetMatch(1))};
+          std::erase_if(reusablePlaylists, [&playlist](const CVideoDatabase::PlaylistInfo& p)
+                        { return p.playlist == playlist; });
+        }
       }
 
       // Use simple menu dialog to select playlist
@@ -4025,19 +4075,24 @@ bool CDiscDirectoryHelper::GetOrShowPlaylistSelection(const CFileItem& item,
   else
   {
     // Silent
+    // The All titles and Menu options are not playlists
+    const auto playlistCount{std::ranges::count_if(
+        sourceItems, [](const auto& sourceItem)
+        { return sourceItem->HasProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST); })};
+
     // A scan must not store a guess, or later playback would use it without asking
     if (sourceItems[0]->GetProperty(MULTIPLE_SPECIALS_PROPERTY).asBoolean(false))
     {
-      CLog::LogF(LOGDEBUG, "Not choosing between the {} specials offered for {}",
-                 sourceItems.Size(), CURL::GetRedacted(directory));
+      CLog::LogF(LOGDEBUG, "Not choosing between the {} specials offered for {}", playlistCount,
+                 CURL::GetRedacted(directory));
       return false;
     }
 
-    if (sourceItems.Size() > 1 && !returnMultipleItems)
+    if (playlistCount > 1 && !returnMultipleItems)
     {
       CLog::LogF(LOGDEBUG, "Automatically selected playlist {} of the {} offered for {}",
-                 sourceItems[0]->GetProperty("bluray_playlist").asInteger32(0), sourceItems.Size(),
-                 CURL::GetRedacted(directory));
+                 sourceItems[0]->GetProperty(KODI::ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger32(0),
+                 playlistCount, CURL::GetRedacted(directory));
     }
   }
 
@@ -4045,7 +4100,8 @@ bool CDiscDirectoryHelper::GetOrShowPlaylistSelection(const CFileItem& item,
                     {
                       auto newItem{std::make_shared<CFileItem>(originalItem)};
                       ApplyPlaylistDetails(*newItem, selectedItem);
-                      newItem->SetProperty("original_listitem_url", originalItem.GetDynPath());
+                      newItem->SetProperty(KODI::ITEM::PROPERTY::ORIGINAL_LISTITEM_URL,
+                                           originalItem.GetDynPath());
                       return newItem;
                     }};
 
@@ -4053,14 +4109,7 @@ bool CDiscDirectoryHelper::GetOrShowPlaylistSelection(const CFileItem& item,
   if (!selectedItem.GetPath().empty())
   {
     // If SelectedItem is not empty then we have a user selected playlist, so return it
-    const auto newItem{GenerateItem(item, selectedItem)};
-
-    // GenerateItem points the paths in the tag at the newly selected playlist
-    // Flag so CSaveFileStateJob can tell playlist has changed
-    if (selectedItem.GetDynPath() != item.GetDynPath())
-      newItem->SetProperty("new_playlist_path", true);
-
-    items.Add(newItem);
+    items.Add(GenerateItem(item, selectedItem));
   }
   else if (!returnMultipleItems)
     // Return single item

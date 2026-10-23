@@ -15,16 +15,18 @@
 #include "TextureCacheJob.h"
 #include "ThumbLoader.h"
 #include "Util.h"
-#include "cores/VideoPlayer/DVDFileInfo.h"
 #include "filesystem/Directory.h"
+#include "filesystem/File.h"
 #include "imagefiles/ImageFileURL.h"
 #include "jobs/Job.h"
 #include "jobs/JobManager.h"
 #include "jobs/JobQueue.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
+#include "utils/ArtTypes.h"
 #include "utils/ArtUtils.h"
 #include "utils/FileExtensionProvider.h"
+#include "utils/ItemProperties.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
 #include "utils/log.h"
@@ -42,6 +44,7 @@
 
 using namespace XFILE;
 using namespace ADDON;
+using KODI::MEDIA::NameOf;
 
 namespace
 {
@@ -63,7 +66,10 @@ void CacheArtwork(const std::string& url,
   }
 
   bool needsRecaching{false};
-  if (!textureCache->CheckCachedImage(url, needsRecaching).empty() && !needsRecaching)
+  const std::string cachedImage{textureCache->CheckCachedImage(url, needsRecaching)};
+  // A cached copy whose file has gone is cached again. An image that is its own copy is not
+  if (!cachedImage.empty() && !needsRecaching &&
+      (cachedImage == IMAGE_FILES::ToCacheKey(url) || CFile::Exists(cachedImage)))
     return; // already cached
 
   // Fetch art or recache as needed
@@ -107,11 +113,11 @@ std::string ContentToMediaType(ContentType content, bool folder)
   {
     using enum ContentType;
     case MOVIES:
-      return MediaTypeMovie;
+      return NameOf(KODI::MEDIA::TYPE::MOVIE);
     case MUSICVIDEOS:
-      return MediaTypeMusicVideo;
+      return NameOf(KODI::MEDIA::TYPE::MUSIC_VIDEO);
     case TVSHOWS:
-      return folder ? MediaTypeTvShow : MediaTypeEpisode;
+      return folder ? NameOf(KODI::MEDIA::TYPE::TV_SHOW) : NameOf(KODI::MEDIA::TYPE::EPISODE);
     default:
       return "";
   }
@@ -239,10 +245,11 @@ ArtPriority PriorityOfArtType(std::string_view artType)
     artType.remove_prefix(4);
 
   // Numbered, where a scraper offers more than one eg. "fanart2"
-  if (artType.starts_with("fanart"))
+  if (artType.starts_with(ART::TYPE::FANART))
     return ArtPriority::BACKGROUND;
 
-  if (artType == "poster" || artType == "thumb" || artType == "banner" || artType == "keyart")
+  if (artType == ART::TYPE::POSTER || artType == ART::TYPE::THUMB || artType == ART::TYPE::BANNER ||
+      artType == "keyart")
     return ArtPriority::LIST;
 
   return ArtPriority::DETAIL;
@@ -274,7 +281,7 @@ void CVideoInfoScannerArt::GetArtwork(CFileItem* pItem,
   std::vector<std::string> movieSetArtTypes;
   if (moviePartOfSet)
   {
-    movieSetArtTypes = CVideoThumbLoader::GetArtTypes(MediaTypeVideoCollection);
+    movieSetArtTypes = CVideoThumbLoader::GetArtTypes(MEDIA::TYPE::VIDEO_COLLECTION);
     for (const std::string& artType : movieSetArtTypes)
       artTypes.push_back("set." + artType);
   }
@@ -308,7 +315,7 @@ void CVideoInfoScannerArt::GetArtwork(CFileItem* pItem,
       }
       else if (content == ContentType::MOVIE_VERSIONS ||
                (pItem->HasVideoVersions() &&
-                pItem->GetProperty("bluray_playlist").asInteger32(-1) > -1))
+                pItem->GetProperty(ITEM::PROPERTY::BLURAY_PLAYLIST).asInteger32(-1) > -1))
       {
         // Add playlist identifier only when there are multiple versions of the movie on the same disc
         path =
@@ -351,13 +358,13 @@ void CVideoInfoScannerArt::GetArtwork(CFileItem* pItem,
   }
 
   // add online fanart (treated separately due to it being stored in m_fanart)
-  if ((addAll || CVideoThumbLoader::IsArtTypeInWhitelist("fanart", artTypes, exactName)) &&
-      !art.contains("fanart"))
+  if ((addAll || CVideoThumbLoader::IsArtTypeInWhitelist(ART::TYPE::FANART, artTypes, exactName)) &&
+      !art.contains(ART::TYPE::FANART))
   {
     std::string fanart = pItem->GetVideoInfoTag()->m_fanart.GetImageURL();
     if (!fanart.empty() &&
         !(useRemoteArt == UseRemoteArtWithLocalScraper::NO && URIUtils::IsRemote(fanart)))
-      art.insert(std::make_pair("fanart", fanart));
+      art.insert(std::make_pair(ART::TYPE::FANART, fanart));
   }
 
   // add online art
@@ -368,7 +375,7 @@ void CVideoInfoScannerArt::GetArtwork(CFileItem* pItem,
     std::string aspect = url.m_aspect;
     if (aspect.empty())
       // Backward compatibility with Kodi 11 Eden NFO files
-      aspect = mediaType == MediaTypeEpisode ? "thumb" : "poster";
+      aspect = mediaType == NameOf(MEDIA::TYPE::EPISODE) ? ART::TYPE::THUMB : ART::TYPE::POSTER;
 
     if ((addAll || CVideoThumbLoader::IsArtTypeInWhitelist(aspect, artTypes, exactName)) &&
         !art.contains(aspect))
@@ -380,12 +387,12 @@ void CVideoInfoScannerArt::GetArtwork(CFileItem* pItem,
     }
   }
 
-  if (!art.contains("thumb") &&
+  if (!art.contains(ART::TYPE::THUMB) &&
       CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
           CSettings::SETTING_MYVIDEOS_EXTRACTTHUMB) &&
-      CDVDFileInfo::CanExtract(mediaItem ? *mediaItem : *pItem))
+      CVideoThumbLoader::CanExtractEmbeddedThumb(mediaItem ? *mediaItem : *pItem))
   {
-    art["thumb"] = CVideoThumbLoader::GetEmbeddedThumbURL(mediaItem ? *mediaItem : *pItem);
+    art[ART::TYPE::THUMB] = CVideoThumbLoader::GetEmbeddedThumbURL(mediaItem ? *mediaItem : *pItem);
   }
 
   std::vector<ArtToCache> artToCache;
@@ -411,7 +418,7 @@ void CVideoInfoScannerArt::GetArtwork(CFileItem* pItem,
                      useRemoteArt);
   }
   if (bApplyToDir)
-    ApplyThumbToFolder(parentDir, art["thumb"]);
+    ApplyThumbToFolder(parentDir, art[ART::TYPE::THUMB]);
 }
 
 std::string CVideoInfoScannerArt::GetImage(const CScraperUrl::SUrlEntry& image,
@@ -435,7 +442,7 @@ void CVideoInfoScannerArt::ApplyThumbToFolder(const std::string& folder,
   {
     CFileItem folderItem(folder, true);
     CThumbLoader loader;
-    loader.SetCachedImage(folderItem, "thumb", imdbThumb);
+    loader.SetCachedImage(folderItem, ART::TYPE::THUMB, imdbThumb);
   }
 }
 
@@ -502,7 +509,7 @@ void CVideoInfoScannerArt::GetSeasonThumbs(const CVideoInfoTag& show,
       continue;
     std::string aspect = url.m_aspect;
     if (aspect.empty())
-      aspect = "thumb";
+      aspect = ART::TYPE::THUMB;
     KODI::ART::Artwork& art = seasonArt[url.m_season];
     if ((addAll || CVideoThumbLoader::IsArtTypeInWhitelist(aspect, artTypes, exactName)) &&
         !art.contains(aspect))

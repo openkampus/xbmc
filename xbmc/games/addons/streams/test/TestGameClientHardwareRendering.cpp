@@ -20,8 +20,12 @@
 #include "cores/RetroPlayer/streams/RetroPlayerRendering.h"
 #include "cores/RetroPlayer/streams/RetroPlayerVideo.h"
 #include "filesystem/File.h"
+#include "games/GameServices.h"
+#include "games/GameSettings.h"
 #include "games/addons/GameClient.h"
 #include "games/addons/GameClientInGameSaves.h"
+#include "games/addons/GameClientProperties.h"
+#include "games/addons/cheevos/GameClientCheevos.h"
 #include "games/addons/disc/GameClientDiscs.h"
 #include "games/addons/streams/GameClientStreams.h"
 #include "settings/Settings.h"
@@ -292,9 +296,12 @@ public:
 class DevKitInstance
 {
 public:
-  explicit DevKitInstance(CGameClientStreams& streams)
+  explicit DevKitInstance(CGameClientStreams& streams,
+                          const char* kodiVersion = ADDON_INSTANCE_VERSION_GAME,
+                          const char* libretroCore = nullptr)
     : m_previous(kodi::addon::CPrivateBase::m_interface)
   {
+    m_props.libretro_core = libretroCore;
     m_callbacks.kodiInstance = &streams;
     m_callbacks.OpenStream = [](KODI_HANDLE instance,
                                 const game_stream_properties* properties) -> KODI_GAME_STREAM_HANDLE
@@ -313,6 +320,7 @@ public:
                                      unsigned int width, unsigned int height,
                                      game_stream_buffer* buffer)
     { return static_cast<IGameClientStream*>(stream)->GetBuffer(width, height, *buffer); };
+    m_info.version = kodiVersion;
     m_instance.info = &m_info;
     m_instance.functions = &m_functions;
     m_instance.game = &m_game;
@@ -326,11 +334,14 @@ public:
     kodi::addon::CPrivateBase::m_interface = m_previous;
   }
 
+  std::string LibretroCore() const { return m_addon->LibretroCore(); }
+
 private:
   AddonGlobalInterface* m_previous;
   AddonToKodiFuncTable_Game m_callbacks{};
   KodiToAddonFuncTable_Game m_addonCallbacks{};
-  AddonInstance_Game m_game{nullptr, &m_callbacks, &m_addonCallbacks};
+  AddonProps_Game m_props{};
+  AddonInstance_Game m_game{&m_props, &m_callbacks, &m_addonCallbacks};
   KODI_ADDON_INSTANCE_INFO m_info{};
   KODI_ADDON_INSTANCE_FUNC m_functions{};
   KODI_ADDON_INSTANCE_STRUCT m_instance{};
@@ -1058,6 +1069,85 @@ TEST_F(TestGameClientHardwareRendering, StreamOpenFailureReleasesManagerOwnershi
   EXPECT_EQ(m_manager.closed, 1U);
 }
 
+namespace
+{
+// Signs a player in for one test, with hardcore as given, and puts the
+// settings back after it
+class CHardcoreSettings
+{
+public:
+  explicit CHardcoreSettings(bool hardcore)
+    : m_settings(CServiceBroker::GetSettingsComponent()->GetSettings()),
+      m_hardcore(m_settings->GetBool("gamesachievements.hardcore")),
+      m_username(m_settings->GetString("gamesachievements.username")),
+      m_token(m_settings->GetString("gamesachievements.token"))
+  {
+    m_settings->SetString("gamesachievements.username", "player");
+    m_settings->SetString("gamesachievements.token", "token");
+    SetHardcore(hardcore);
+  }
+
+  ~CHardcoreSettings()
+  {
+    SetHardcore(m_hardcore);
+    m_settings->SetString("gamesachievements.token", m_token);
+    m_settings->SetString("gamesachievements.username", m_username);
+  }
+
+  // Settings only call back once they are loaded, which tests never do, so
+  // the change is passed on here as Kodi would
+  void SetHardcore(bool hardcore)
+  {
+    m_settings->SetBool("gamesachievements.hardcore", hardcore);
+    CServiceBroker::GetGameServices().GameSettings().OnSettingChanged(
+        m_settings->GetSetting("gamesachievements.hardcore"));
+  }
+
+  bool Hardcore() const { return m_settings->GetBool("gamesachievements.hardcore"); }
+
+private:
+  const std::shared_ptr<CSettings> m_settings;
+  const bool m_hardcore;
+  const std::string m_username;
+  const std::string m_token;
+};
+
+// A client that plays on in casual mode whenever it is asked for hardcore
+void RefuseHardcore(KodiToAddonFuncTable_Game& callbacks)
+{
+  callbacks.SetRetroAchievementsCredentials = [](const AddonInstance_Game*, const char*,
+                                                 const char*) { return GAME_ERROR_NO_ERROR; };
+  callbacks.RCSetHardcoreEnabled = [](const AddonInstance_Game*, bool enabled)
+  { return enabled ? GAME_ERROR_REJECTED : GAME_ERROR_NO_ERROR; };
+  callbacks.RCSetEncoreModeEnabled = [](const AddonInstance_Game*, bool)
+  { return GAME_ERROR_NO_ERROR; };
+}
+} // namespace
+
+TEST_F(TestGameClientHardwareRendering, HardcoreTurnsOffWhenRefusedAtSignIn)
+{
+  RETRO::CPlaybackTestEnvironment environment;
+  CHardcoreSettings settings(true);
+  RefuseHardcore(*m_client->GetInstanceInterface()->toAddon);
+
+  EXPECT_TRUE(m_client->Cheevos().SendCredentials());
+  EXPECT_FALSE(settings.Hardcore());
+}
+
+TEST_F(TestGameClientHardwareRendering, HardcoreTurnsOffWhenRefusedDuringPlay)
+{
+  RETRO::CPlaybackTestEnvironment environment;
+  CHardcoreSettings settings(false);
+  RefuseHardcore(*m_client->GetInstanceInterface()->toAddon);
+  ASSERT_TRUE(m_client->Cheevos().SendCredentials());
+  m_client->Cheevos().ObserveSettings();
+
+  settings.SetHardcore(true);
+  EXPECT_FALSE(settings.Hardcore());
+
+  m_client->Cheevos().StopObservingSettings();
+}
+
 TEST_F(TestGameClientHardwareRendering, RewindRetriesUntilSerializationBecomesAvailable)
 {
   RETRO::CPlaybackTestEnvironment environment;
@@ -1078,6 +1168,35 @@ TEST_F(TestGameClientHardwareRendering, RewindRetriesUntilSerializationBecomesAv
     EXPECT_EQ(m_core.sizeQueries, 5U);
   }
   settings->SetBool("gamesgeneral.enablerewind", rewindEnabled);
+}
+
+TEST_F(TestGameClientHardwareRendering, PropertiesPassTheLibretroCore)
+{
+  CXBMCTinyXML2 xml;
+  const std::string addonXml =
+      R"(<addon id="game.test.core" name="Core test" version="1.0.0">
+      <extension point="kodi.gameclient" library="test.so">
+        <libretro_core>test_libretro</libretro_core>
+      </extension>
+      <extension point="kodi.addon.metadata"><platform>all</platform></extension>
+    </addon>)";
+  ASSERT_TRUE(xml.Parse(addonXml));
+  CGameClient client(
+      ADDON::CAddonInfoBuilder::Generate(xml.RootElement(), ADDON::RepositoryDirInfo{}));
+  ASSERT_TRUE(client.AddonProperties().InitializeProperties());
+  ASSERT_NE(client.GetInstanceInterface()->props->libretro_core, nullptr);
+  EXPECT_STREQ(client.GetInstanceInterface()->props->libretro_core, "test_libretro");
+}
+
+TEST_F(TestGameClientHardwareRendering, DevKitReadsTheLibretroCoreFromNewerKodi)
+{
+  // An 8.2.0 Kodi's properties end before the field
+  {
+    DevKitInstance addon(m_client->Streams(), "8.2.0", "test_libretro");
+    EXPECT_EQ(addon.LibretroCore(), "");
+  }
+  DevKitInstance addon(m_client->Streams(), "8.2.1", "test_libretro");
+  EXPECT_EQ(addon.LibretroCore(), "test_libretro");
 }
 
 TEST_F(TestGameClientHardwareRendering, DevKitInstallsHandleBeforeSingleReset)

@@ -40,6 +40,8 @@ list(APPEND ffmpeg_conf --disable-doc
                         --disable-sdl2
                         --disable-vulkan
                         --enable-gpl
+                        --enable-version3
+                        --enable-openssl
                         --enable-runtime-cpudetect
                         --enable-pthreads
                         --extra-version="Kodi"
@@ -117,11 +119,6 @@ elseif(CPU MATCHES mips)
   list(APPEND ffmpeg_conf --disable-mips32r2 --disable-mipsdsp --disable-mipsdspr2)
 endif()
 
-find_package(GnuTLS)
-if(GNUTLS_FOUND)
-  list(APPEND ffmpeg_conf --enable-gnutls)
-endif()
-
 if(CPU MATCHES x86 OR CPU MATCHES x86_64)
   find_package(NASM REQUIRED)
   list(APPEND ffmpeg_conf --x86asmexe=${NASM_EXECUTABLE})
@@ -136,6 +133,11 @@ if(ENABLE_DAV1D)
   list(APPEND env_vars "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}")
 else()
   list(APPEND ffmpeg_conf --disable-libdav1d)
+endif()
+
+if(ENABLE_LIBOPUS)
+  list(APPEND ffmpeg_conf --enable-libopus)
+  list(APPEND env_vars "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}")
 endif()
 
 if(EXTRA_FLAGS)

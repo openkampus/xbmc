@@ -19,6 +19,7 @@
 #include "settings/AdvancedSettings.h"
 #include "settings/MediaSettings.h"
 #include "settings/SettingsComponent.h"
+#include "utils/ItemProperties.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
 #include "utils/log.h"
@@ -75,6 +76,9 @@ bool CApplicationStackHelper::InitializeStack(const CFileItem& item)
   const auto stack{std::make_shared<CFileItem>(item)};
   for (int i = 0; const auto& file : m_originalStackItems)
   {
+    // This adds a blank VideoInfoTag, if none exists, to avoid mis-identification as a game
+    file->GetVideoInfoTag();
+
     const std::string& path{file->GetPath()};
     const auto& part{GetOrCreateStackPartInformation(path)};
     part->stackItem = stack;
@@ -185,9 +189,9 @@ void CApplicationStackHelper::GetStackPartAndOptions(CFileItem& item,
   bool updated{false};
 
   std::string path{item.GetDynPath()}; // stack:// path
-  if (item.HasProperty("original_listitem_url") &&
-      URIUtils::IsPlugin(item.GetProperty("original_listitem_url").asString()))
-    path = item.GetProperty("original_listitem_url").asString();
+  if (item.HasProperty(KODI::ITEM::PROPERTY::ORIGINAL_LISTITEM_URL) &&
+      URIUtils::IsPlugin(item.GetProperty(KODI::ITEM::PROPERTY::ORIGINAL_LISTITEM_URL).asString()))
+    path = item.GetProperty(KODI::ITEM::PROPERTY::ORIGINAL_LISTITEM_URL).asString();
 
   if (restart)
   {

@@ -676,6 +676,8 @@ std::string CSMB::URLEncode(const CURL& url)
     }
     flat += "@";
   }
+  /* libsmbclient takes the first literal ':' in the server as the port separator and
+     doesn't understand brackets, so the colons of an IPv6 host have to stay encoded */
   flat += URLEncode(url.GetHostName());
 
   if (url.HasPort())
@@ -819,13 +821,14 @@ bool CSMBFile::Open(const CURL& url)
 
   std::string strFileName;
   m_fd = OpenFile(url, strFileName);
+  const int openErrno = errno;
 
   CLog::Log(LOGDEBUG, "CSMBFile::Open - opened {}, fd={}", url.GetRedacted(), m_fd);
   if (m_fd == -1)
   {
     // write error to logfile
     CLog::Log(LOGERROR, "SMBFile->Open: Unable to open file : '{}'\nunix_err:'{:x}' error : '{}'",
-              CURL::GetRedacted(strFileName), errno, strerror(errno));
+              CURL::GetRedacted(strFileName), openErrno, strerror(openErrno));
     return false;
   }
 
@@ -1538,9 +1541,10 @@ bool CSMBFile::OpenForWrite(const CURL& url, bool bOverWrite)
 
   if (m_fd == -1)
   {
+    const int openErrno = errno;
     // write error to logfile
     CLog::Log(LOGERROR, "SMBFile->Open: Unable to open file : '{}'\nunix_err:'{:x}' error : '{}'",
-              CURL::GetRedacted(strFileName), errno, strerror(errno));
+              CURL::GetRedacted(strFileName), openErrno, strerror(openErrno));
     return false;
   }
 

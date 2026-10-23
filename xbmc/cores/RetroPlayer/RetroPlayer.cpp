@@ -27,10 +27,8 @@
 #include "cores/RetroPlayer/process/RPProcessInfo.h"
 #include "cores/RetroPlayer/rendering/RPRenderManager.h"
 #include "cores/RetroPlayer/rendering/RenderContext.h"
-#include "cores/RetroPlayer/savestates/ISavestate.h"
-#include "cores/RetroPlayer/savestates/SavestateDatabase.h"
 #include "cores/RetroPlayer/streams/RPStreamManager.h"
-#include "dialogs/GUIDialogYesNo.h"
+#include "dialogs/GUIDialogKaiToast.h"
 #include "games/GameServices.h"
 #include "games/GameSettings.h"
 #include "games/GameUtils.h"
@@ -74,6 +72,24 @@ CRetroPlayer::~CRetroPlayer()
 }
 
 bool CRetroPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options)
+{
+  // A dialog shown while a game opens, such as the one reporting that it
+  // failed to load, runs the message loop, which can ask this player to open
+  // another game before the first has finished opening or been unloaded
+  if (m_opening)
+  {
+    CLog::Log(LOGERROR, "RetroPlayer[PLAYER]: Can't open a game while another is opening");
+    return false;
+  }
+
+  m_opening = true;
+  const bool opened = Open(file, options);
+  m_opening = false;
+
+  return opened;
+}
+
+bool CRetroPlayer::Open(const CFileItem& file, const CPlayerOptions& options)
 {
   CFileItem fileCopy(file);
 
@@ -160,35 +176,6 @@ bool CRetroPlayer::OpenFile(const CFileItem& file, const CPlayerOptions& options
       CLog::Log(LOGERROR, "RetroPlayer[PLAYER]: Failed to initialize {}", gameClientId);
   }
 
-  if (bSuccess && !bStandalone)
-  {
-    CSavestateDatabase savestateDb;
-
-    std::unique_ptr<ISavestate> save = CSavestateDatabase::AllocateSavestate();
-    if (savestateDb.GetSavestate(savestatePath, *save))
-    {
-      // Check if game client is the same
-      if (save->GameClientID() != m_gameClient->ID())
-      {
-        ADDON::AddonPtr addon;
-        if (CServiceBroker::GetAddonMgr().GetAddon(save->GameClientID(), addon,
-                                                   ADDON::OnlyEnabled::CHOICE_YES))
-        {
-          // Warn the user that continuing with a different game client will
-          // overwrite the save
-          bool dummy;
-          if (!CGUIDialogYesNo::ShowAndGetInput(
-                  438,
-                  StringUtils::Format(
-                      CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(35217),
-                      addon->Name()),
-                  dummy, 222, 35218, 0))
-            bSuccess = false;
-        }
-      }
-    }
-  }
-
   if (bSuccess)
   {
     // Switch to fullscreen
@@ -227,6 +214,9 @@ bool CRetroPlayer::CloseFile(bool reopen /* = false */)
 
   UnregisterWindowCallbacks();
 
+  if (m_renderManager)
+    m_renderManager->FlushRendered();
+
   m_playbackControl.reset();
 
   std::unique_lock lock(m_mutex);
@@ -245,9 +235,7 @@ bool CRetroPlayer::CloseFile(bool reopen /* = false */)
       CLog::Log(LOGDEBUG, "RetroPlayer[SAVE]: Failed to save state at close");
   }
 
-  if (m_playback)
-    m_playback->Deinitialize();
-  m_playback.reset();
+  ResetPlayback();
 
   if (m_input)
     m_input->StopAgentManager();
@@ -278,8 +266,8 @@ bool CRetroPlayer::CloseFile(bool reopen /* = false */)
     m_processInfo->ResetInfo();
   }
   m_processInfo.reset();
-  CLog::Log(LOGDEBUG, "RetroPlayer[PLAYER]: Playback ended");
-  m_callback.OnPlayBackEnded();
+  CLog::Log(LOGDEBUG, "RetroPlayer[PLAYER]: Playback stopped");
+  m_callback.OnPlayBackStopped();
 
   return true;
 }
@@ -407,6 +395,9 @@ uint64_t CRetroPlayer::GetTotalTime()
 
 void CRetroPlayer::SetSpeed(float speed)
 {
+  if (RefuseSpeedInHardcore(static_cast<double>(speed)))
+    return;
+
   if (m_playback->GetSpeed() != static_cast<double>(speed))
   {
     if (speed == 1.0f)
@@ -481,6 +472,8 @@ void CRetroPlayer::FrameMove()
 
   if (m_playbackControl)
     m_playbackControl->FrameMove();
+
+  LeaveSpeedRefusedInHardcore();
 
   if (m_processInfo)
     m_processInfo->SetPlayTimes(0, GetTime(), 0, GetTotalTime());
@@ -589,6 +582,9 @@ void CRetroPlayer::CloseOSDCallback()
 
 void CRetroPlayer::SetPlaybackSpeed(double speed)
 {
+  if (RefuseSpeedInHardcore(speed))
+    return;
+
   if (m_playback)
   {
     if (m_playback->GetSpeed() != speed)
@@ -627,6 +623,42 @@ void CRetroPlayer::RequestAutosave()
   m_playback->RequestAutosave();
 }
 
+bool CRetroPlayer::RefuseSpeedInHardcore(double speed) const
+{
+  if (!m_gameServices.GameSettings().GetAchievementsHardcore())
+    return false;
+
+  // Rewind runs the game backwards, so it arrives here as a negative speed
+  if (speed < 0.0)
+  {
+    CLog::Log(LOGDEBUG, "RetroPlayer[PLAYER]: Refusing to rewind in hardcore mode");
+    GAME::CGameUtils::NotifyBlockedByHardcore(35309); // "Rewind"
+    return true;
+  }
+
+  if (speed > 0.0 && speed < 1.0)
+  {
+    CLog::Log(LOGDEBUG, "RetroPlayer[PLAYER]: Refusing to slow down in hardcore mode");
+    GAME::CGameUtils::NotifyBlockedByHardcore(35701); // "Slow motion"
+    return true;
+  }
+
+  return false;
+}
+
+void CRetroPlayer::LeaveSpeedRefusedInHardcore()
+{
+  if (!m_playback || !m_gameServices.GameSettings().GetAchievementsHardcore())
+    return;
+
+  const double speed = m_playback->GetSpeed();
+  if (speed < 0.0 || (speed > 0.0 && speed < 1.0))
+  {
+    CLog::Log(LOGDEBUG, "RetroPlayer[PLAYER]: Hardcore mode started, returning to normal speed");
+    SetPlaybackSpeed(1.0);
+  }
+}
+
 void CRetroPlayer::SetSpeedInternal(double speed)
 {
   OnSpeedChange(speed);
@@ -634,7 +666,13 @@ void CRetroPlayer::SetSpeedInternal(double speed)
   if (speed == 0.0)
     m_playback->PauseAsync();
   else
+  {
     m_playback->SetSpeed(speed);
+
+    // Rewinding runs the game loop slower than the speed shown
+    if (speed < 0.0 && m_gameClient && m_gameClient->RequiresGameLoop())
+      m_renderManager->SetSpeed(m_playback->GetSpeed());
+  }
 }
 
 void CRetroPlayer::OnSpeedChange(double newSpeed)
@@ -669,6 +707,21 @@ void CRetroPlayer::CreatePlayback(const std::string& savestatePath)
     if (!bStandalone)
     {
       CLog::Log(LOGDEBUG, "RetroPlayer[SAVE]: Loading savestate");
+
+      // RetroAchievements requires a resumed session to drop to casual: the
+      // player did not reach the state being resumed from in this session.
+      // Done before the load, which is otherwise refused while hardcore is on.
+      GAME::CGameSettings& gameSettings = m_gameServices.GameSettings();
+      if (gameSettings.GetAchievementsHardcore())
+      {
+        CLog::Log(LOGINFO, "RetroPlayer[SAVE]: Resuming from a savestate, dropping to casual mode");
+        gameSettings.SetAchievementsHardcore(false);
+
+        // "RetroAchievements", "Hardcore mode turned off. Achievements will be..."
+        const auto& strings = CServiceBroker::GetResourcesComponent().GetLocalizeStrings();
+        CGUIDialogKaiToast::QueueNotification(CGUIDialogKaiToast::Info, strings.Get(35264),
+                                              strings.Get(35306));
+      }
 
       if (!LoadSavestate(savestatePath))
         CLog::Log(LOGERROR, "RetroPlayer[SAVE]: Failed to load savestate");

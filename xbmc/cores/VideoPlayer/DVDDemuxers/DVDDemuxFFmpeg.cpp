@@ -20,16 +20,15 @@
 #include "commons/Exception.h"
 #include "cores/FFmpeg.h"
 #include "cores/MenuType.h"
-#include "cores/VideoPlayer/Interface/TimingConstants.h" // for DVD_TIME_BASE
 #include "filesystem/CurlFile.h"
 #include "filesystem/Directory.h"
 #include "filesystem/File.h"
+#include "language/LanguageTag.h"
 #include "settings/AdvancedSettings.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
 #include "threads/SystemClock.h"
 #include "utils/FontUtils.h"
-#include "utils/LanguageTag.h"
 #include "utils/StreamUtils.h"
 #include "utils/StringUtils.h"
 #include "utils/URIUtils.h"
@@ -59,7 +58,7 @@ extern "C"
 #include <libavutil/pixdesc.h>
 }
 
-using namespace KODI::UTILS;
+using namespace KODI::LANGUAGE;
 using namespace std::chrono_literals;
 
 struct StereoModeConversionMap
@@ -228,6 +227,25 @@ bool CDVDDemuxFFmpeg::Aborted()
   std::shared_ptr<CDVDInputStreamFFmpeg> input = std::dynamic_pointer_cast<CDVDInputStreamFFmpeg>(m_pInput);
   if (input && input->Aborted())
     return true;
+
+  return false;
+}
+
+bool CDVDDemuxFFmpeg::IsStreaming() const
+{
+  if (m_pInput && m_pInput->IsStreaming())
+    return true;
+
+  if (m_pFormatContext && m_pFormatContext->iformat)
+  {
+    auto names = StringUtils::Split(m_pFormatContext->iformat->name, ",");
+    return std::ranges::any_of(names,
+                               [](const std::string& name)
+                               {
+                                 return name == "hls" || name == "applehttp" || name == "dash" ||
+                                        name == "rtsp" || name == "live_flv";
+                               });
+  }
 
   return false;
 }
@@ -1182,6 +1200,7 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
               ConvertTimestamp(m_pkt.pkt.dts, stream->time_base.den, stream->time_base.num);
           pPacket->duration = DVD_SEC_TO_TIME((double)m_pkt.pkt.duration * stream->time_base.num /
                                               stream->time_base.den);
+          pPacket->m_keyFrame = (m_pkt.pkt.flags & AV_PKT_FLAG_KEY) != 0;
 
           CDVDDemuxUtils::StoreSideData(pPacket, &m_pkt.pkt);
 
